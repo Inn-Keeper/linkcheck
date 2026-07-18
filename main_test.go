@@ -10,9 +10,85 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestRetryRecoversFromTransientFailure(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) < 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+	}))
+	defer srv.Close()
+
+	root, _ := url.Parse(srv.URL)
+	c := newCrawler(root, 1, 5*time.Second)
+	c.backoff = time.Millisecond
+	_, broken := c.run(context.Background(), 2)
+
+	if len(broken) != 0 {
+		t.Errorf("got broken %v after recovery, want none", broken)
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("server saw %d requests, want 3", got)
+	}
+}
+
+func TestRetryGivesUpAfterMaxAttempts(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	root, _ := url.Parse(srv.URL)
+	c := newCrawler(root, 1, 5*time.Second)
+	c.backoff = time.Millisecond
+	_, broken := c.run(context.Background(), 2)
+
+	if len(broken) != 1 || broken[0].Status != http.StatusInternalServerError {
+		t.Fatalf("got broken %v, want one HTTP 500", broken)
+	}
+	if got := calls.Load(); got != maxAttempts {
+		t.Errorf("server saw %d requests, want %d", got, maxAttempts)
+	}
+}
+
+func TestRateLimitSpacesRequests(t *testing.T) {
+	mux := http.NewServeMux()
+	page := func(html string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, html)
+		}
+	}
+	mux.HandleFunc("/{$}", page(`<a href="/a">a</a> <a href="/b">b</a>`))
+	mux.HandleFunc("/a", page(``))
+	mux.HandleFunc("/b", page(``))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	root, _ := url.Parse(srv.URL)
+	c := newCrawler(root, 2, 5*time.Second)
+	c.rps = 10 // 3 urls at 10 rps, burst 1 → at least ~200ms
+
+	start := time.Now()
+	checked, broken := c.run(context.Background(), 4)
+	elapsed := time.Since(start)
+
+	if checked != 3 || len(broken) != 0 {
+		t.Fatalf("checked %d, broken %v; want 3 checked, none broken", checked, broken)
+	}
+	if elapsed < 150*time.Millisecond {
+		t.Errorf("crawl took %v, want >= 150ms with rate limiting", elapsed)
+	}
+}
 
 func TestReportJSONRoundTrip(t *testing.T) {
 	rep := report{

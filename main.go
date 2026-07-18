@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // ponytail: regex link extraction; swap for golang.org/x/net/html if unquoted
@@ -24,6 +26,8 @@ var hrefRe = regexp.MustCompile(`(?i)href\s*=\s*["']([^"']+)["']`)
 const (
 	maxBodySize      = 2 << 20 // don't slurp unbounded pages into memory
 	progressInterval = 200 * time.Millisecond
+	maxAttempts      = 3                      // total tries per url on transient failures
+	retryBackoff     = 500 * time.Millisecond // doubles per retry
 )
 
 type result struct {
@@ -71,11 +75,15 @@ type crawler struct {
 	client   *http.Client
 	root     *url.URL
 	maxDepth int
-	timeout  time.Duration
-	progress io.Writer // nil disables the live progress line
+	progress io.Writer     // nil disables the live progress line
+	rps      float64       // per-host request rate; <= 0 means unlimited
+	backoff  time.Duration // first retry delay, doubles per attempt
 
 	mu      sync.Mutex
 	visited map[string]bool
+
+	limMu    sync.Mutex
+	limiters map[string]*rate.Limiter // one per host
 
 	jobs    chan job
 	results chan result
@@ -84,11 +92,12 @@ type crawler struct {
 
 func newCrawler(root *url.URL, maxDepth int, timeout time.Duration) *crawler {
 	return &crawler{
-		client:   &http.Client{},
+		client:   &http.Client{Timeout: timeout},
 		root:     root,
 		maxDepth: maxDepth,
-		timeout:  timeout,
+		backoff:  retryBackoff,
 		visited:  map[string]bool{},
+		limiters: map[string]*rate.Limiter{},
 		jobs:     make(chan job, 64),
 		results:  make(chan result, 64),
 	}
@@ -174,15 +183,7 @@ func (c *crawler) process(ctx context.Context, j job) {
 	if ctx.Err() != nil {
 		return // shutting down; skip so cancellations aren't counted as broken
 	}
-	reqCtx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, j.u.String(), nil)
-	if err != nil {
-		c.results <- result{URL: j.u.String(), Err: err.Error(), FoundOn: j.foundOn}
-		return
-	}
-	resp, err := c.client.Do(req)
+	resp, err := c.fetch(ctx, j.u)
 	if err != nil {
 		if ctx.Err() != nil {
 			return // cancelled mid-flight, not a broken link
@@ -214,6 +215,57 @@ func (c *crawler) process(ctx context.Context, j job) {
 	}
 }
 
+// retryable reports whether a fetch outcome is worth another attempt:
+// transport errors, 429, or any 5xx.
+func retryable(resp *http.Response, err error) bool {
+	return err != nil || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+}
+
+// fetch GETs u after waiting for the host's rate limiter, retrying transient
+// failures with doubling backoff. The last attempt's response or error is
+// returned as-is.
+func (c *crawler) fetch(ctx context.Context, u *url.URL) (*http.Response, error) {
+	for attempt := 1; ; attempt++ {
+		if err := c.limiter(u.Host).Wait(ctx); err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.client.Do(req)
+		if !retryable(resp, err) || attempt == maxAttempts {
+			return resp, err
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(c.backoff << (attempt - 1)):
+		}
+	}
+}
+
+// limiter returns the rate limiter for host, creating it on first use.
+func (c *crawler) limiter(host string) *rate.Limiter {
+	c.limMu.Lock()
+	defer c.limMu.Unlock()
+	l, ok := c.limiters[host]
+	if !ok {
+		limit := rate.Inf
+		if c.rps > 0 {
+			limit = rate.Limit(c.rps)
+		}
+		// ponytail: burst 1 keeps requests evenly spaced; bump if a host
+		// tolerates small bursts and the crawl feels slow.
+		l = rate.NewLimiter(limit, 1)
+		c.limiters[host] = l
+	}
+	return l
+}
+
 // extractLinks returns absolute http(s) URLs referenced by href attributes,
 // resolved against base, with fragments stripped.
 func extractLinks(base *url.URL, body string) []*url.URL {
@@ -238,6 +290,7 @@ func main() {
 	workers := flag.Int("workers", 8, "number of concurrent fetchers")
 	timeout := flag.Duration("timeout", 10*time.Second, "per-request timeout")
 	jsonOut := flag.Bool("json", false, "emit results as JSON")
+	rps := flag.Float64("rps", 10, "max requests per second per host (0 = unlimited)")
 	flag.Parse()
 
 	if flag.NArg() != 1 {
@@ -255,6 +308,7 @@ func main() {
 	defer stop()
 
 	c := newCrawler(root, *depth, *timeout)
+	c.rps = *rps
 	if st, err := os.Stderr.Stat(); err == nil && st.Mode()&os.ModeCharDevice != 0 {
 		c.progress = os.Stderr
 	}

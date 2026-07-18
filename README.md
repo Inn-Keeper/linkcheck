@@ -3,8 +3,8 @@
 Concurrent broken-link checker. Point it at a URL; it crawls same-host HTML
 pages and reports every link that fails — external links included.
 
-Stdlib only, no dependencies. Built as a Go study project: worker pools,
-channels, `context` cancellation, table-driven tests.
+Built as a Go study project: worker pools, channels, `context` cancellation,
+table-driven tests. Single dependency: `golang.org/x/time/rate`.
 
 ## Usage
 
@@ -19,6 +19,7 @@ go build -o linkcheck .
 | `-workers` | `8` | number of concurrent fetchers |
 | `-timeout` | `10s` | per-request timeout |
 | `-json` | `false` | emit results as JSON |
+| `-rps` | `10` | max requests per second per host (`0` = unlimited) |
 
 ```console
 $ ./linkcheck -depth 2 https://example.com
@@ -41,6 +42,10 @@ stderr is a terminal). Ctrl+C stops cleanly and prints partial results.
   that owns the counters — no shared state, no locks on the hot path.
 - One `context` from `signal.NotifyContext` threads through every request;
   interrupting cancels in-flight fetches without reporting them as broken.
+- Transient failures (transport errors, 429, 5xx) are retried up to twice
+  with doubling backoff; the backoff wait aborts on Ctrl+C via `select`.
+- A `rate.Limiter` per host spaces requests out (`-rps`), so the tool is
+  polite to real sites.
 - Links are extracted with a regex and resolved against the page URL.
   Same-host HTML pages within the depth limit are crawled; everything else
   is only checked.
