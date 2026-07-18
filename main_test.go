@@ -1,0 +1,109 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestCrawlFindsBrokenLinks(t *testing.T) {
+	mux := http.NewServeMux()
+	page := func(html string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, html)
+		}
+	}
+	mux.HandleFunc("/{$}", page(`<a href="/ok">ok</a> <a href="/missing">bad</a>`))
+	mux.HandleFunc("/ok", page(`<a href="/">home</a> <a href="/also-missing">bad2</a>`))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	root, _ := url.Parse(srv.URL)
+	checked, broken := newCrawler(root, 3, 5*time.Second).run(context.Background(), 4)
+
+	if checked != 4 {
+		t.Errorf("checked %d urls, want 4", checked)
+	}
+	if len(broken) != 2 {
+		t.Fatalf("got %d broken links %v, want 2", len(broken), broken)
+	}
+	if !strings.HasSuffix(broken[0].URL, "/also-missing") || broken[0].Status != http.StatusNotFound {
+		t.Errorf("broken[0] = %+v, want 404 on /also-missing", broken[0])
+	}
+	if !strings.HasSuffix(broken[1].URL, "/missing") || broken[1].Status != http.StatusNotFound {
+		t.Errorf("broken[1] = %+v, want 404 on /missing", broken[1])
+	}
+}
+
+func TestCrawlAllGood(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<a href="/">self</a>`)
+	}))
+	defer srv.Close()
+
+	root, _ := url.Parse(srv.URL)
+	checked, broken := newCrawler(root, 2, 5*time.Second).run(context.Background(), 4)
+	if checked != 1 || len(broken) != 0 {
+		t.Fatalf("checked %d, broken %v; want 1 checked, none broken", checked, broken)
+	}
+}
+
+func TestCancelStopsCrawl(t *testing.T) {
+	block := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-block // hang every request until the test ends
+	}))
+	defer srv.Close()
+	defer close(block)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	root, _ := url.Parse(srv.URL)
+	start := time.Now()
+	_, broken := newCrawler(root, 2, 30*time.Second).run(ctx, 2)
+
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("run took %v after cancel, want prompt return", elapsed)
+	}
+	if len(broken) != 0 {
+		t.Errorf("cancelled requests reported as broken: %v", broken)
+	}
+}
+
+func TestExtractLinks(t *testing.T) {
+	base, _ := url.Parse("https://example.com/dir/page.html")
+	tests := []struct {
+		name, body string
+		want       []string
+	}{
+		{"relative", `<a href="other.html">x</a>`, []string{"https://example.com/dir/other.html"}},
+		{"rooted", `<a href="/top">x</a>`, []string{"https://example.com/top"}},
+		{"absolute", `<a href="http://other.org/p">x</a>`, []string{"http://other.org/p"}},
+		{"fragment stripped", `<a href="/top#sec">x</a>`, []string{"https://example.com/top"}},
+		{"single quotes", `<a href='/top'>x</a>`, []string{"https://example.com/top"}},
+		{"mailto skipped", `<a href="mailto:a@b.c">x</a>`, nil},
+		{"none", `no links here`, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			for _, u := range extractLinks(base, tt.body) {
+				got = append(got, u.String())
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tt.want) {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
