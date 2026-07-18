@@ -181,6 +181,35 @@ func TestCancelStopsCrawl(t *testing.T) {
 	}
 }
 
+func FuzzExtractLinks(f *testing.F) {
+	for _, seed := range []string{
+		`<a href="other.html">x</a>`,
+		`<a href='/top#sec'>x</a>`,
+		`<a href="mailto:a@b.c">x</a>`,
+		`<a href="http://other.org/p">x</a>`,
+		`<a href="http:///no-host">x</a>`,
+		`href = " ://%%bad% "`,
+		`no links here`,
+	} {
+		f.Add(seed)
+	}
+	base, _ := url.Parse("https://example.com/dir/page.html")
+	f.Fuzz(func(t *testing.T, body string) {
+		// Must never panic, and every extracted URL must be fetchable-shaped.
+		for _, u := range extractLinks(base, body) {
+			if u.Scheme != "http" && u.Scheme != "https" {
+				t.Errorf("bad scheme %q from body %q", u.Scheme, body)
+			}
+			if u.Host == "" {
+				t.Errorf("empty host in %q from body %q", u, body)
+			}
+			if u.Fragment != "" {
+				t.Errorf("fragment kept in %q from body %q", u, body)
+			}
+		}
+	})
+}
+
 func TestExtractLinks(t *testing.T) {
 	base, _ := url.Parse("https://example.com/dir/page.html")
 	tests := []struct {

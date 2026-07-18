@@ -276,7 +276,7 @@ func extractLinks(base *url.URL, body string) []*url.URL {
 			continue
 		}
 		abs := base.ResolveReference(ref)
-		if abs.Scheme != "http" && abs.Scheme != "https" {
+		if (abs.Scheme != "http" && abs.Scheme != "https") || abs.Host == "" {
 			continue
 		}
 		abs.Fragment = ""
