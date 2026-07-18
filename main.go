@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -26,13 +27,39 @@ const (
 )
 
 type result struct {
-	URL     string
-	Status  int // 0 when Err is set
-	Err     string
-	FoundOn string
+	URL     string `json:"url"`
+	Status  int    `json:"status,omitempty"` // 0 when Err is set
+	Err     string `json:"error,omitempty"`
+	FoundOn string `json:"found_on"`
 }
 
 func (r result) broken() bool { return r.Err != "" || r.Status >= 400 }
+
+type report struct {
+	Checked     int      `json:"checked"`
+	Interrupted bool     `json:"interrupted,omitempty"`
+	Broken      []result `json:"broken"`
+}
+
+func (rep report) write(w io.Writer, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rep)
+	}
+	if rep.Interrupted {
+		fmt.Fprintln(w, "interrupted; partial results:")
+	}
+	fmt.Fprintf(w, "checked %d urls, %d broken\n", rep.Checked, len(rep.Broken))
+	for _, r := range rep.Broken {
+		if r.Err != "" {
+			fmt.Fprintf(w, "  %s (on %s): %s\n", r.URL, r.FoundOn, r.Err)
+		} else {
+			fmt.Fprintf(w, "  %s (on %s): HTTP %d\n", r.URL, r.FoundOn, r.Status)
+		}
+	}
+	return nil
+}
 
 type job struct {
 	u       *url.URL
@@ -210,6 +237,7 @@ func main() {
 	depth := flag.Int("depth", 2, "how many levels of same-host pages to crawl")
 	workers := flag.Int("workers", 8, "number of concurrent fetchers")
 	timeout := flag.Duration("timeout", 10*time.Second, "per-request timeout")
+	jsonOut := flag.Bool("json", false, "emit results as JSON")
 	flag.Parse()
 
 	if flag.NArg() != 1 {
@@ -232,16 +260,10 @@ func main() {
 	}
 	checked, broken := c.run(ctx, *workers)
 
-	if ctx.Err() != nil {
-		fmt.Println("interrupted; partial results:")
-	}
-	fmt.Printf("checked %d urls, %d broken\n", checked, len(broken))
-	for _, r := range broken {
-		if r.Err != "" {
-			fmt.Printf("  %s (on %s): %s\n", r.URL, r.FoundOn, r.Err)
-		} else {
-			fmt.Printf("  %s (on %s): HTTP %d\n", r.URL, r.FoundOn, r.Status)
-		}
+	rep := report{Checked: checked, Interrupted: ctx.Err() != nil, Broken: broken}
+	if err := rep.write(os.Stdout, *jsonOut); err != nil {
+		fmt.Fprintln(os.Stderr, "linkcheck:", err)
+		os.Exit(2)
 	}
 	if len(broken) > 0 {
 		os.Exit(1)

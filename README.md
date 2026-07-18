@@ -8,18 +8,19 @@ channels, `context` cancellation, table-driven tests.
 
 ## Usage
 
-```
+```sh
 go build -o linkcheck .
 ./linkcheck [flags] <url>
 ```
 
 | Flag | Default | Meaning |
-|------|---------|---------|
+| ---- | ------- | ------- |
 | `-depth` | `2` | how many levels of same-host pages to crawl |
 | `-workers` | `8` | number of concurrent fetchers |
 | `-timeout` | `10s` | per-request timeout |
+| `-json` | `false` | emit results as JSON |
 
-```
+```console
 $ ./linkcheck -depth 2 https://example.com
 checked 107 urls, 2 broken
   https://example.com/old-post (on https://example.com/blog): HTTP 404
@@ -46,7 +47,7 @@ stderr is a terminal). Ctrl+C stops cleanly and prints partial results.
 
 ## Tests
 
-```
+```sh
 go test -race ./...
 ```
 

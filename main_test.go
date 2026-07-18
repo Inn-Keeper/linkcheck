@@ -1,15 +1,39 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestReportJSONRoundTrip(t *testing.T) {
+	rep := report{
+		Checked: 3,
+		Broken: []result{
+			{URL: "http://x/a", Status: 404, FoundOn: "http://x/"},
+			{URL: "http://x/b", Err: "dial tcp: no such host", FoundOn: "http://x/"},
+		},
+	}
+	var buf bytes.Buffer
+	if err := rep.write(&buf, true); err != nil {
+		t.Fatal(err)
+	}
+	var got report
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, buf.Bytes())
+	}
+	if !reflect.DeepEqual(got, rep) {
+		t.Errorf("round-trip mismatch:\ngot  %+v\nwant %+v", got, rep)
+	}
+}
 
 func TestCrawlFindsBrokenLinks(t *testing.T) {
 	mux := http.NewServeMux()
