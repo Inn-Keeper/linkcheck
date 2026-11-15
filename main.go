@@ -112,7 +112,7 @@ func newCrawler(root *url.URL, maxDepth int, timeout time.Duration) *crawler {
 // urls were checked and the broken ones sorted by URL.
 func (c *crawler) run(ctx context.Context, workers int) (int, []result) {
 	var checked int
-	var broken []result
+	broken := []result{} // non-nil so JSON says [] rather than null
 	collectorDone := make(chan struct{})
 	go func() {
 		defer close(collectorDone)

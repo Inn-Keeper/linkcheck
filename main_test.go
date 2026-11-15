@@ -153,6 +153,10 @@ func TestCrawlAllGood(t *testing.T) {
 	if checked != 1 || len(broken) != 0 {
 		t.Fatalf("checked %d, broken %v; want 1 checked, none broken", checked, broken)
 	}
+	out, _ := json.Marshal(report{Checked: checked, Broken: broken})
+	if !strings.Contains(string(out), `"broken":[]`) {
+		t.Errorf("clean run JSON = %s, want an empty broken array", out)
+	}
 }
 
 func TestCancelStopsCrawl(t *testing.T) {
