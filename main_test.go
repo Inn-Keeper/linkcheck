@@ -261,6 +261,43 @@ func TestMissingHostIsNotRetried(t *testing.T) {
 	}
 }
 
+func TestDepthLimitStopsCrawl(t *testing.T) {
+	var deepHits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/{$}", htmlPage(`<a href="/1">1</a>`))
+	mux.HandleFunc("/1", htmlPage(`<a href="/2">2</a>`))
+	mux.HandleFunc("/2", htmlPage(`<a href="/3">3</a>`))
+	mux.HandleFunc("/3", func(w http.ResponseWriter, r *http.Request) { deepHits.Add(1) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	root, _ := url.Parse(srv.URL)
+	checked, _ := newCrawler(root, 2, 5*time.Second).run(context.Background(), 4)
+	// Depth 2 checks /2 but does not read its links.
+	if checked != 3 || deepHits.Load() != 0 {
+		t.Fatalf("checked %d, /3 fetched %d times; want 3 checked, /3 never fetched", checked, deepHits.Load())
+	}
+}
+
+func TestExternalLinksCheckedNotCrawled(t *testing.T) {
+	var deepHits atomic.Int32
+	extMux := http.NewServeMux()
+	extMux.HandleFunc("/page", htmlPage(`<a href="/deeper">x</a>`))
+	extMux.HandleFunc("/deeper", func(w http.ResponseWriter, r *http.Request) { deepHits.Add(1) })
+	ext := httptest.NewServer(extMux) // different port, so a different host
+	defer ext.Close()
+
+	srv := httptest.NewServer(htmlPage(`<a href="` + ext.URL + `/page">ext</a>`))
+	defer srv.Close()
+
+	root, _ := url.Parse(srv.URL)
+	checked, broken := newCrawler(root, 5, 5*time.Second).run(context.Background(), 4)
+	if checked != 2 || len(broken) != 0 || deepHits.Load() != 0 {
+		t.Fatalf("checked %d, broken %v, external /deeper fetched %d times; want 2 checked, none broken, never fetched",
+			checked, broken, deepHits.Load())
+	}
+}
+
 func FuzzExtractLinks(f *testing.F) {
 	for _, seed := range []string{
 		`<a href="other.html">x</a>`,
