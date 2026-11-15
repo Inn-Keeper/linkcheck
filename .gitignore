@@ -1,5 +1,6 @@
 /linkcheck
+/linkcheckd
 
 # macOS ghosts
 .DS_Store
-._*/linkcheckd
+._*
