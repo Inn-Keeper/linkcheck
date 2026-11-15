@@ -35,14 +35,15 @@ const (
 )
 
 type config struct {
-	timeout      time.Duration // hard deadline per crawl
-	maxDepth     int           // highest depth a caller may ask for
-	maxURLs      int           // urls checked per crawl
-	maxCrawls    int           // crawls running at once, server-wide
-	ratePerMin   float64       // checks per minute per client address
-	burst        int           // checks a client may make back to back
-	origins      []string      // browser origins allowed by CORS; "*" for any
-	allowPrivate bool          // local development only: lets callers reach internal addresses
+	timeout        time.Duration // hard deadline per crawl
+	maxDepth       int           // highest depth a caller may ask for
+	maxURLs        int           // urls checked per crawl
+	maxCrawls      int           // crawls running at once, server-wide
+	ratePerMin     float64       // checks per minute per client address
+	burst          int           // checks a client may make back to back
+	origins        []string      // browser origins allowed by CORS; "*" for any
+	clientIPHeader string        // trusted proxy header carrying the client address; "" uses the peer
+	allowPrivate   bool          // local development only: lets callers reach internal addresses
 }
 
 // ipLimiter gives every client address its own token bucket.
@@ -109,12 +110,18 @@ func (l *ipLimiter) wait(addr netip.Addr) time.Duration {
 	return d
 }
 
-// clientIP is the peer address of the connection. Forwarding headers are
-// ignored on purpose: with no trusted proxy in front, callers could forge
-// them to dodge the limit.
-// ponytail: behind a load balancer every caller shares its address; read
-// the balancer's header here once there is one.
-func clientIP(r *http.Request) netip.Addr {
+// clientIP is the address to rate limit. With no header configured it is
+// the peer of the connection. Behind a proxy every caller shares that
+// address, so header names the one request header the proxy sets itself and
+// callers cannot forge (CF-Connecting-IP behind Cloudflare). Never
+// X-Forwarded-For: proxies append to whatever the caller sent.
+func clientIP(r *http.Request, header string) netip.Addr {
+	if header != "" {
+		if a, err := netip.ParseAddr(strings.TrimSpace(r.Header.Get(header))); err == nil {
+			return a
+		}
+		// Missing or malformed: fall back to the peer, the stricter bucket.
+	}
 	ap, err := netip.ParseAddrPort(r.RemoteAddr)
 	if err != nil {
 		return netip.Addr{} // unparseable peers share one bucket
@@ -200,7 +207,8 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 func (s *server) check(w http.ResponseWriter, r *http.Request) {
 	// First, before any work: every request counts, valid or not.
-	if d := s.limiter.wait(clientIP(r)); d > 0 {
+	ip := clientIP(r, s.cfg.clientIPHeader)
+	if d := s.limiter.wait(ip); d > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(d.Seconds()))))
 		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
@@ -254,7 +262,7 @@ func (s *server) check(w http.ResponseWriter, r *http.Request) {
 	}
 	// Hitting the deadline is not an error: the report says interrupted.
 	log.Printf("check %q from %s: %d checked, %d broken, interrupted=%t, %s",
-		req.URL, r.RemoteAddr, rep.Checked, len(rep.Broken), rep.Interrupted, time.Since(start).Round(time.Millisecond))
+		req.URL, ip, rep.Checked, len(rep.Broken), rep.Interrupted, time.Since(start).Round(time.Millisecond))
 	writeJSON(w, http.StatusOK, rep)
 }
 
@@ -267,6 +275,7 @@ func main() {
 	ratePerMin := flag.Float64("rate", 6, "checks per minute allowed per client IP")
 	burst := flag.Int("burst", 3, "checks a client IP may make back to back")
 	origins := flag.String("cors-origins", "", `comma-separated browser origins allowed to call the API, e.g. "https://app.example.com"; "*" allows any`)
+	clientIPHeader := flag.String("client-ip-header", "", `header a trusted proxy sets to the client address, e.g. "CF-Connecting-IP"; empty uses the TCP peer`)
 	allowPrivate := flag.Bool("allow-private", false, "UNSAFE: allow crawling private/loopback addresses (local development)")
 	flag.Parse()
 
@@ -274,14 +283,15 @@ func main() {
 		log.Fatal("linkcheckd: -timeout, -max-urls, -max-crawls, -rate and -burst must be positive, -max-depth not negative")
 	}
 	cfg := config{
-		timeout:      *timeout,
-		maxDepth:     *maxDepth,
-		maxURLs:      *maxURLs,
-		maxCrawls:    *maxCrawls,
-		ratePerMin:   *ratePerMin,
-		burst:        *burst,
-		origins:      parseOrigins(*origins),
-		allowPrivate: *allowPrivate,
+		timeout:        *timeout,
+		maxDepth:       *maxDepth,
+		maxURLs:        *maxURLs,
+		maxCrawls:      *maxCrawls,
+		ratePerMin:     *ratePerMin,
+		burst:          *burst,
+		origins:        parseOrigins(*origins),
+		clientIPHeader: *clientIPHeader,
+		allowPrivate:   *allowPrivate,
 	}
 	srv := &http.Server{
 		Addr:              *addr,

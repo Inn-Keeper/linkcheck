@@ -102,16 +102,19 @@ $ curl -s localhost:8080/v1/checks -H 'Content-Type: application/json' \
 | `-rate` | `6` | checks per minute per client IP (IPv6: per /64) |
 | `-burst` | `3` | checks a client IP may make back to back |
 | `-cors-origins` | none | comma-separated browser origins allowed to call the API; `*` for any |
+| `-client-ip-header` | none | header a trusted proxy sets to the client address, e.g. `CF-Connecting-IP`; unset uses the TCP peer |
 | `-allow-private` | `false` | **unsafe**, local development only: allow private/loopback targets |
 
 Things to know before deploying:
 
 - Callers can only reach public addresses; the private-network guard is
   always on unless `-allow-private` is set.
-- The client IP is the TCP peer. Forwarding headers are ignored because
-  anyone can forge them. If you later put a proxy or load balancer in
-  front, every caller will share its IP until `clientIP` is taught to
-  trust that proxy's header.
+- By default the client IP is the TCP peer. Behind a proxy or load balancer
+  (Render, Cloudflare) every caller then shares one rate-limit bucket, so
+  set `-client-ip-header` to the header that proxy sets itself, such as
+  `CF-Connecting-IP`. Do not use `X-Forwarded-For`: proxies append to
+  whatever the caller sent, so it can be forged. Only set the flag when the
+  service is reachable solely through that proxy.
 - Rate-limit state is in memory, per process. Run one instance, or move it
   to a shared store first.
 - There is no authentication and no TLS; terminate TLS in front or add it.
