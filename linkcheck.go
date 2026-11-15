@@ -411,10 +411,27 @@ func (c *crawler) limiter(host string) *rate.Limiter {
 	return l
 }
 
+// connectionHint reports whether a <link> only asks the browser to warm up
+// a connection (rel=preconnect or dns-prefetch). Its href names a host, not
+// a page, and fetching it reports healthy CDNs as broken.
+func connectionHint(attrs []html.Attribute) bool {
+	for _, a := range attrs {
+		if a.Key != "rel" {
+			continue
+		}
+		for _, rel := range strings.Fields(strings.ToLower(a.Val)) {
+			if rel == "preconnect" || rel == "dns-prefetch" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // extractLinks returns absolute http(s) URLs referenced by href and src
 // attributes, resolved against base (or the page's <base href>), with
-// fragments stripped. The tokenizer decodes entities and skips comments and
-// script bodies.
+// fragments stripped. The tokenizer decodes entities and skips comments,
+// script bodies and connection hints.
 // ponytail: srcset and CSS url() are not followed; add if images in those
 // matter.
 func extractLinks(base *url.URL, body string) []*url.URL {
@@ -426,6 +443,9 @@ func extractLinks(base *url.URL, body string) []*url.URL {
 			return out // io.EOF, or malformed input: keep what we found
 		case html.StartTagToken, html.SelfClosingTagToken:
 			t := z.Token()
+			if t.Data == "link" && connectionHint(t.Attr) {
+				continue
+			}
 			for _, a := range t.Attr {
 				if a.Key != "href" && a.Key != "src" {
 					continue
