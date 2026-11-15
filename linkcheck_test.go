@@ -135,9 +135,26 @@ func TestCheck(t *testing.T) {
 	}
 }
 
-func TestCheckRejectsBadURL(t *testing.T) {
-	if _, err := Check(context.Background(), "not a url", Options{}); err == nil {
-		t.Error("Check accepted a url with no host")
+func TestCheckRejectsBadInput(t *testing.T) {
+	tests := []struct {
+		name, url string
+		opts      Options
+	}{
+		{"no host", "not a url", Options{}},
+		{"no scheme", "example.com", Options{}},
+		{"non-http scheme", "ftp://example.com/", Options{}},
+		{"file scheme", "file:///etc/passwd", Options{}},
+		{"negative workers", "http://example.com/", Options{Workers: -1}},
+		{"negative depth", "http://example.com/", Options{MaxDepth: -1}},
+		{"negative timeout", "http://example.com/", Options{Timeout: -time.Second}},
+		{"negative rps", "http://example.com/", Options{RPS: -1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := Check(context.Background(), tt.url, tt.opts); err == nil {
+				t.Error("Check accepted bad input")
+			}
+		})
 	}
 }
 

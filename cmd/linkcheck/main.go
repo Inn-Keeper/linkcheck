@@ -49,6 +49,11 @@ func main() {
 		flag.PrintDefaults()
 		os.Exit(2)
 	}
+	// The library treats 0 as "use the default"; on the command line it is a mistake.
+	if *workers < 1 || *timeout <= 0 {
+		fmt.Fprintln(os.Stderr, "linkcheck: -workers must be at least 1 and -timeout positive")
+		os.Exit(2)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()

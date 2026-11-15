@@ -68,8 +68,11 @@ type Options struct {
 // the partial Report (Interrupted set) together with ctx's error.
 func Check(ctx context.Context, rootURL string, opts Options) (Report, error) {
 	root, err := url.Parse(rootURL)
-	if err != nil || root.Host == "" {
-		return Report{}, fmt.Errorf("linkcheck: invalid url %q", rootURL)
+	if err != nil || (root.Scheme != "http" && root.Scheme != "https") || root.Host == "" {
+		return Report{}, fmt.Errorf("linkcheck: %q is not an absolute http(s) url", rootURL)
+	}
+	if opts.MaxDepth < 0 || opts.Workers < 0 || opts.Timeout < 0 || opts.RPS < 0 {
+		return Report{}, errors.New("linkcheck: MaxDepth, Workers, Timeout and RPS must not be negative")
 	}
 	if opts.Workers == 0 {
 		opts.Workers = defaultWorkers
