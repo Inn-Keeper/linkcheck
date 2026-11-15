@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +27,7 @@ const (
 	progressInterval = 200 * time.Millisecond
 	maxAttempts      = 3                      // total tries per url on transient failures
 	retryBackoff     = 500 * time.Millisecond // doubles per retry
+	maxRetryAfter    = 30 * time.Second       // longest Retry-After we will honour
 	defaultUserAgent = "linkcheck/1.0"        // Go's default UA gets blocked a lot
 )
 
@@ -226,9 +230,29 @@ func (c *crawler) process(ctx context.Context, j job) {
 }
 
 // retryable reports whether a fetch outcome is worth another attempt:
-// transport errors, 429, or any 5xx.
+// transport errors (except a host that doesn't exist), 429, or any 5xx.
 func retryable(resp *http.Response, err error) bool {
-	return err != nil || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+	if err != nil {
+		var dnsErr *net.DNSError
+		return !(errors.As(err, &dnsErr) && dnsErr.IsNotFound)
+	}
+	return resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+}
+
+// retryDelay is how long to wait before the next attempt: the server's
+// Retry-After if it sent one (capped at maxRetryAfter), never less than backoff.
+func retryDelay(resp *http.Response, backoff time.Duration) time.Duration {
+	if resp == nil {
+		return backoff
+	}
+	var d time.Duration
+	ra := resp.Header.Get("Retry-After")
+	if secs, err := strconv.Atoi(ra); err == nil {
+		d = time.Duration(secs) * time.Second
+	} else if t, err := http.ParseTime(ra); err == nil {
+		d = time.Until(t)
+	}
+	return min(max(d, backoff), maxRetryAfter)
 }
 
 // fetch GETs u after waiting for the host's rate limiter, retrying transient
@@ -248,13 +272,14 @@ func (c *crawler) fetch(ctx context.Context, u *url.URL) (*http.Response, error)
 		if !retryable(resp, err) || attempt == maxAttempts {
 			return resp, err
 		}
+		delay := retryDelay(resp, c.backoff<<(attempt-1))
 		if resp != nil {
 			resp.Body.Close()
 		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(c.backoff << (attempt - 1)):
+		case <-time.After(delay):
 		}
 	}
 }

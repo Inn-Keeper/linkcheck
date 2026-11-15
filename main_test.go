@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -222,6 +224,40 @@ func TestSendsUserAgent(t *testing.T) {
 	_, broken := newCrawler(root, 0, 5*time.Second).run(context.Background(), 1)
 	if len(broken) != 0 {
 		t.Fatalf("server rejected the User-Agent: %v", broken)
+	}
+}
+
+func TestRetryHonoursRetryAfter(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+		}
+	}))
+	defer srv.Close()
+
+	root, _ := url.Parse(srv.URL)
+	c := newCrawler(root, 0, 5*time.Second)
+	c.backoff = time.Millisecond
+	start := time.Now()
+	_, broken := c.run(context.Background(), 1)
+
+	if len(broken) != 0 {
+		t.Errorf("got broken %v, want recovery after Retry-After", broken)
+	}
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+		t.Errorf("retried after %v, want >= 1s from Retry-After", elapsed)
+	}
+}
+
+func TestMissingHostIsNotRetried(t *testing.T) {
+	notFound := &url.Error{Op: "Get", Err: &net.OpError{Op: "dial", Err: &net.DNSError{IsNotFound: true}}}
+	if retryable(nil, notFound) {
+		t.Error("DNS not-found is retried, want a single attempt")
+	}
+	if !retryable(nil, &url.Error{Op: "Get", Err: errors.New("connection reset")}) {
+		t.Error("connection reset is not retried, want a retry")
 	}
 }
 
