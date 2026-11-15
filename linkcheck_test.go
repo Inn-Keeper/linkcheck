@@ -464,6 +464,9 @@ func TestExtractLinks(t *testing.T) {
 		{"comment ignored", `<!-- <a href="/old">x</a> -->`, nil},
 		{"script ignored", `<script>var s = '<a href="/js">x</a>';</script>`, nil},
 		{"src checked", `<img src="/logo.png">`, []string{"https://example.com/logo.png"}},
+		{"preconnect skipped", `<link rel="preconnect" href="https://cdn.example.net">`, nil},
+		{"dns-prefetch skipped", `<link rel="DNS-Prefetch preload" href="//cdn.example.net">`, nil},
+		{"stylesheet kept", `<link rel="stylesheet" href="/s.css">`, []string{"https://example.com/s.css"}},
 		{"unquoted", `<a href=/bare>x</a>`, []string{"https://example.com/bare"}},
 		{"base href", `<base href="/docs/"><a href="p.html">x</a>`, []string{"https://example.com/docs/p.html"}},
 	}
