@@ -364,11 +364,28 @@ func TestDenyPrivateNetworksBlocksLoopback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rep.Broken) != 1 || !strings.Contains(rep.Broken[0].Err, "not public") {
-		t.Errorf("report = %+v, want the loopback url refused", rep)
+	if len(rep.Broken) != 1 || rep.Broken[0].Err != errBlocked.Error() {
+		t.Errorf("report = %+v, want the loopback url refused without echoing the address", rep)
 	}
 	if hits.Load() != 0 {
 		t.Errorf("loopback server got %d requests, want 0", hits.Load())
+	}
+}
+
+func TestMaxURLsTruncates(t *testing.T) {
+	var links strings.Builder
+	for i := range 10 {
+		fmt.Fprintf(&links, `<a href="/p%d">x</a>`, i)
+	}
+	srv := httptest.NewServer(htmlPage(links.String()))
+	defer srv.Close()
+
+	rep, err := Check(context.Background(), srv.URL, Options{MaxDepth: 1, MaxURLs: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Checked != 3 || !rep.Truncated {
+		t.Errorf("report = %+v, want 3 checked and Truncated", rep)
 	}
 }
 

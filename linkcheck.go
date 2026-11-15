@@ -48,6 +48,9 @@ type Report struct {
 	Checked     int      `json:"checked"`
 	Interrupted bool     `json:"interrupted,omitempty"`
 	Broken      []Result `json:"broken"` // sorted by URL; never nil after Check
+	// Truncated is set when Options.MaxURLs was reached, so some links
+	// were found but not checked.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // Options tunes a Check. The zero value is usable.
@@ -57,6 +60,7 @@ type Options struct {
 	Timeout   time.Duration // per request; 0 means 10s
 	RPS       float64       // max requests per second per host; 0 means unlimited
 	UserAgent string        // "" means "linkcheck/1.0"
+	MaxURLs   int           // stop queueing after this many URLs; 0 means unlimited
 
 	// DenyPrivateNetworks refuses to connect to loopback, private,
 	// link-local and other non-public addresses, including via redirects
@@ -80,8 +84,8 @@ func Check(ctx context.Context, rootURL string, opts Options) (Report, error) {
 	if err != nil || (root.Scheme != "http" && root.Scheme != "https") || root.Host == "" {
 		return Report{}, fmt.Errorf("linkcheck: %q is not an absolute http(s) url", rootURL)
 	}
-	if opts.MaxDepth < 0 || opts.Workers < 0 || opts.Timeout < 0 || opts.RPS < 0 {
-		return Report{}, errors.New("linkcheck: MaxDepth, Workers, Timeout and RPS must not be negative")
+	if opts.MaxDepth < 0 || opts.Workers < 0 || opts.Timeout < 0 || opts.RPS < 0 || opts.MaxURLs < 0 {
+		return Report{}, errors.New("linkcheck: MaxDepth, Workers, Timeout, RPS and MaxURLs must not be negative")
 	}
 	if opts.Workers == 0 {
 		opts.Workers = defaultWorkers
@@ -94,12 +98,18 @@ func Check(ctx context.Context, rootURL string, opts Options) (Report, error) {
 	c.rps = opts.RPS
 	c.onProgress = opts.OnProgress
 	c.denyPrivate = opts.DenyPrivateNetworks
+	c.maxURLs = opts.MaxURLs
 	defer c.client.CloseIdleConnections()
 	if opts.UserAgent != "" {
 		c.userAgent = opts.UserAgent
 	}
 	checked, broken := c.run(ctx, opts.Workers)
-	return Report{Checked: checked, Interrupted: ctx.Err() != nil, Broken: broken}, ctx.Err()
+	return Report{
+		Checked:     checked,
+		Interrupted: ctx.Err() != nil,
+		Broken:      broken,
+		Truncated:   c.truncated, // run has returned, so no writer is left
+	}, ctx.Err()
 }
 
 type job struct {
@@ -119,8 +129,10 @@ type crawler struct {
 	userAgent   string
 	denyPrivate bool // refuse to dial non-public addresses
 
-	mu      sync.Mutex
-	visited map[string]bool
+	mu        sync.Mutex
+	visited   map[string]bool
+	maxURLs   int  // 0 means unlimited
+	truncated bool // maxURLs turned a new url away
 
 	limMu    sync.Mutex
 	limiters map[string]*rate.Limiter // one per host
@@ -258,9 +270,14 @@ func (c *crawler) enqueue(ctx context.Context, j job) {
 	key := j.u.String()
 	c.mu.Lock()
 	seen := c.visited[key]
-	c.visited[key] = true
+	full := c.maxURLs > 0 && len(c.visited) >= c.maxURLs
+	if !seen && full {
+		c.truncated = true
+	} else {
+		c.visited[key] = true
+	}
 	c.mu.Unlock()
-	if seen {
+	if seen || full {
 		return
 	}
 	c.wg.Add(1)
@@ -278,7 +295,11 @@ func (c *crawler) process(ctx context.Context, j job) {
 		if ctx.Err() != nil {
 			return // cancelled mid-flight, not a broken link
 		}
-		c.results <- Result{URL: j.u.String(), Err: err.Error(), FoundOn: j.foundOn}
+		msg := err.Error()
+		if errors.Is(err, errBlocked) {
+			msg = errBlocked.Error() // don't echo the internal address we resolved
+		}
+		c.results <- Result{URL: j.u.String(), Err: msg, FoundOn: j.foundOn}
 		return
 	}
 	defer resp.Body.Close()
