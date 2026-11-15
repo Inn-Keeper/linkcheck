@@ -295,11 +295,7 @@ func (c *crawler) process(ctx context.Context, j job) {
 		if ctx.Err() != nil {
 			return // cancelled mid-flight, not a broken link
 		}
-		msg := err.Error()
-		if errors.Is(err, errBlocked) {
-			msg = errBlocked.Error() // don't echo the internal address we resolved
-		}
-		c.results <- Result{URL: j.u.String(), Err: msg, FoundOn: j.foundOn}
+		c.results <- Result{URL: j.u.String(), Err: errorMessage(err), FoundOn: j.foundOn}
 		return
 	}
 	defer resp.Body.Close()
@@ -333,6 +329,21 @@ func (c *crawler) process(ctx context.Context, j job) {
 	for _, link := range extractLinks(final, string(body)) {
 		c.enqueue(ctx, job{u: link, depth: j.depth + 1, foundOn: final.String()})
 	}
+}
+
+// errorMessage is the text reported for a failed fetch. Reports go to
+// untrusted callers, so it leaves out what the error says about our own
+// network: the internal address a blocked name resolved to, and the DNS
+// server we asked.
+func errorMessage(err error) string {
+	if errors.Is(err, errBlocked) {
+		return errBlocked.Error()
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "lookup " + dnsErr.Name + ": " + dnsErr.Err
+	}
+	return err.Error()
 }
 
 // retryable reports whether a fetch outcome is worth another attempt:
