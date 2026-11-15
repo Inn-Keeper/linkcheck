@@ -1,7 +1,6 @@
-package main
+package linkcheck
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -93,23 +92,61 @@ func TestRateLimitSpacesRequests(t *testing.T) {
 }
 
 func TestReportJSONRoundTrip(t *testing.T) {
-	rep := report{
+	rep := Report{
 		Checked: 3,
-		Broken: []result{
+		Broken: []Result{
 			{URL: "http://x/a", Status: 404, FoundOn: "http://x/"},
 			{URL: "http://x/b", Err: "dial tcp: no such host", FoundOn: "http://x/"},
 		},
 	}
-	var buf bytes.Buffer
-	if err := rep.write(&buf, true); err != nil {
+	out, err := json.Marshal(rep)
+	if err != nil {
 		t.Fatal(err)
 	}
-	var got report
-	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
-		t.Fatalf("output is not valid JSON: %v\n%s", err, buf.Bytes())
+	var got Report
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
 	}
 	if !reflect.DeepEqual(got, rep) {
 		t.Errorf("round-trip mismatch:\ngot  %+v\nwant %+v", got, rep)
+	}
+}
+
+func TestCheck(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/{$}", htmlPage(`<a href="/ok">ok</a> <a href="/missing">bad</a>`))
+	mux.HandleFunc("/ok", htmlPage(``))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	var calls int
+	rep, err := Check(context.Background(), srv.URL, Options{
+		MaxDepth:   1,
+		OnProgress: func(checked, broken int) { calls++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Checked != 3 || len(rep.Broken) != 1 || rep.Broken[0].Status != http.StatusNotFound || rep.Interrupted {
+		t.Errorf("report = %+v, want 3 checked, one 404, not interrupted", rep)
+	}
+	if calls != 3 {
+		t.Errorf("OnProgress called %d times, want 3", calls)
+	}
+}
+
+func TestCheckRejectsBadURL(t *testing.T) {
+	if _, err := Check(context.Background(), "not a url", Options{}); err == nil {
+		t.Error("Check accepted a url with no host")
+	}
+}
+
+func TestCheckCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rep, err := Check(ctx, "http://example.invalid/", Options{})
+	if !errors.Is(err, context.Canceled) || !rep.Interrupted {
+		t.Errorf("got report %+v, err %v; want Interrupted and context.Canceled", rep, err)
 	}
 }
 
@@ -155,7 +192,7 @@ func TestCrawlAllGood(t *testing.T) {
 	if checked != 1 || len(broken) != 0 {
 		t.Fatalf("checked %d, broken %v; want 1 checked, none broken", checked, broken)
 	}
-	out, _ := json.Marshal(report{Checked: checked, Broken: broken})
+	out, _ := json.Marshal(Report{Checked: checked, Broken: broken})
 	if !strings.Contains(string(out), `"broken":[]`) {
 		t.Errorf("clean run JSON = %s, want an empty broken array", out)
 	}

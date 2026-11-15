@@ -1,17 +1,14 @@
-package main
+// Package linkcheck crawls a site and reports its broken links.
+package linkcheck
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,47 +20,72 @@ import (
 )
 
 const (
-	maxBodySize      = 2 << 20 // don't slurp unbounded pages into memory
-	progressInterval = 200 * time.Millisecond
+	maxBodySize      = 2 << 20                // don't slurp unbounded pages into memory
 	maxAttempts      = 3                      // total tries per url on transient failures
 	retryBackoff     = 500 * time.Millisecond // doubles per retry
 	maxRetryAfter    = 30 * time.Second       // longest Retry-After we will honour
 	defaultUserAgent = "linkcheck/1.0"        // Go's default UA gets blocked a lot
+	defaultWorkers   = 8
+	defaultTimeout   = 10 * time.Second
 )
 
-type result struct {
+// Result is the outcome of checking one URL.
+type Result struct {
 	URL     string `json:"url"`
 	Status  int    `json:"status,omitempty"` // 0 when Err is set
 	Err     string `json:"error,omitempty"`
 	FoundOn string `json:"found_on"`
 }
 
-func (r result) broken() bool { return r.Err != "" || r.Status >= 400 }
+// Broken reports whether the URL failed: a transport error or an HTTP
+// status of 400 or above.
+func (r Result) Broken() bool { return r.Err != "" || r.Status >= 400 }
 
-type report struct {
+// Report summarises a crawl. Its JSON encoding is the wire format.
+type Report struct {
 	Checked     int      `json:"checked"`
 	Interrupted bool     `json:"interrupted,omitempty"`
-	Broken      []result `json:"broken"`
+	Broken      []Result `json:"broken"` // sorted by URL; never nil after Check
 }
 
-func (rep report) write(w io.Writer, asJSON bool) error {
-	if asJSON {
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		return enc.Encode(rep)
+// Options tunes a Check. The zero value is usable.
+type Options struct {
+	MaxDepth  int           // levels of same-host pages to crawl; 0 checks only the root URL
+	Workers   int           // concurrent fetchers; 0 means 8
+	Timeout   time.Duration // per request; 0 means 10s
+	RPS       float64       // max requests per second per host; 0 means unlimited
+	UserAgent string        // "" means "linkcheck/1.0"
+
+	// OnProgress, if set, is called after every checked URL with the running
+	// totals. Calls are sequential, from a single goroutine.
+	OnProgress func(checked, broken int)
+}
+
+// Check crawls same-host HTML pages starting at rootURL and checks every link
+// it finds, external ones included. It is safe to call concurrently.
+//
+// To bound a crawl, give ctx a deadline. When ctx ends early, Check returns
+// the partial Report (Interrupted set) together with ctx's error.
+func Check(ctx context.Context, rootURL string, opts Options) (Report, error) {
+	root, err := url.Parse(rootURL)
+	if err != nil || root.Host == "" {
+		return Report{}, fmt.Errorf("linkcheck: invalid url %q", rootURL)
 	}
-	if rep.Interrupted {
-		fmt.Fprintln(w, "interrupted; partial results:")
+	if opts.Workers == 0 {
+		opts.Workers = defaultWorkers
 	}
-	fmt.Fprintf(w, "checked %d urls, %d broken\n", rep.Checked, len(rep.Broken))
-	for _, r := range rep.Broken {
-		if r.Err != "" {
-			fmt.Fprintf(w, "  %s (on %s): %s\n", r.URL, r.FoundOn, r.Err)
-		} else {
-			fmt.Fprintf(w, "  %s (on %s): HTTP %d\n", r.URL, r.FoundOn, r.Status)
-		}
+	if opts.Timeout == 0 {
+		opts.Timeout = defaultTimeout
 	}
-	return nil
+
+	c := newCrawler(root, opts.MaxDepth, opts.Timeout)
+	c.rps = opts.RPS
+	c.onProgress = opts.OnProgress
+	if opts.UserAgent != "" {
+		c.userAgent = opts.UserAgent
+	}
+	checked, broken := c.run(ctx, opts.Workers)
+	return Report{Checked: checked, Interrupted: ctx.Err() != nil, Broken: broken}, ctx.Err()
 }
 
 type job struct {
@@ -73,14 +95,14 @@ type job struct {
 }
 
 type crawler struct {
-	client    *http.Client
-	root      *url.URL
-	host      string // same-host scope; follows the root's redirect, if any
-	maxDepth  int
-	progress  io.Writer     // nil disables the live progress line
-	rps       float64       // per-host request rate; <= 0 means unlimited
-	backoff   time.Duration // first retry delay, doubles per attempt
-	userAgent string
+	client     *http.Client
+	root       *url.URL
+	host       string // same-host scope; follows the root's redirect, if any
+	maxDepth   int
+	onProgress func(checked, broken int) // may be nil
+	rps        float64                   // per-host request rate; <= 0 means unlimited
+	backoff    time.Duration             // first retry delay, doubles per attempt
+	userAgent  string
 
 	mu      sync.Mutex
 	visited map[string]bool
@@ -89,7 +111,7 @@ type crawler struct {
 	limiters map[string]*rate.Limiter // one per host
 
 	jobs    chan job
-	results chan result
+	results chan Result
 	wg      sync.WaitGroup // counts outstanding jobs, not workers
 }
 
@@ -104,34 +126,25 @@ func newCrawler(root *url.URL, maxDepth int, timeout time.Duration) *crawler {
 		visited:   map[string]bool{},
 		limiters:  map[string]*rate.Limiter{},
 		jobs:      make(chan job, 64),
-		results:   make(chan result, 64),
+		results:   make(chan Result, 64),
 	}
 }
 
 // run crawls until no jobs remain or ctx is cancelled. It returns how many
 // urls were checked and the broken ones sorted by URL.
-func (c *crawler) run(ctx context.Context, workers int) (int, []result) {
+func (c *crawler) run(ctx context.Context, workers int) (int, []Result) {
 	var checked int
-	broken := []result{} // non-nil so JSON says [] rather than null
+	broken := []Result{} // non-nil so JSON says [] rather than null
 	collectorDone := make(chan struct{})
 	go func() {
 		defer close(collectorDone)
-		tick := time.NewTicker(progressInterval)
-		defer tick.Stop()
-		for {
-			select {
-			case r, ok := <-c.results:
-				if !ok {
-					return
-				}
-				checked++
-				if r.broken() {
-					broken = append(broken, r)
-				}
-			case <-tick.C:
-				if c.progress != nil {
-					fmt.Fprintf(c.progress, "\rchecked %d, %d broken", checked, len(broken))
-				}
+		for r := range c.results {
+			checked++
+			if r.Broken() {
+				broken = append(broken, r)
+			}
+			if c.onProgress != nil {
+				c.onProgress(checked, len(broken))
 			}
 		}
 	}()
@@ -155,9 +168,6 @@ func (c *crawler) run(ctx context.Context, workers int) (int, []result) {
 	workersWG.Wait()
 	close(c.results)
 	<-collectorDone
-	if c.progress != nil {
-		fmt.Fprint(c.progress, "\r\x1b[2K") // erase the progress line
-	}
 
 	sort.Slice(broken, func(i, j int) bool { return broken[i].URL < broken[j].URL })
 	return checked, broken
@@ -193,7 +203,7 @@ func (c *crawler) process(ctx context.Context, j job) {
 		if ctx.Err() != nil {
 			return // cancelled mid-flight, not a broken link
 		}
-		c.results <- result{URL: j.u.String(), Err: err.Error(), FoundOn: j.foundOn}
+		c.results <- Result{URL: j.u.String(), Err: err.Error(), FoundOn: j.foundOn}
 		return
 	}
 	defer resp.Body.Close()
@@ -207,7 +217,7 @@ func (c *crawler) process(ctx context.Context, j job) {
 		c.host = final.Host
 	}
 
-	r := result{URL: j.u.String(), Status: resp.StatusCode, FoundOn: j.foundOn}
+	r := Result{URL: j.u.String(), Status: resp.StatusCode, FoundOn: j.foundOn}
 	// Recurse only into same-host HTML pages within the depth limit;
 	// external links get checked but never crawled.
 	crawlable := resp.StatusCode < 400 && j.depth < c.maxDepth &&
@@ -337,44 +347,5 @@ func extractLinks(base *url.URL, body string) []*url.URL {
 				out = append(out, abs)
 			}
 		}
-	}
-}
-
-func main() {
-	depth := flag.Int("depth", 2, "how many levels of same-host pages to crawl")
-	workers := flag.Int("workers", 8, "number of concurrent fetchers")
-	timeout := flag.Duration("timeout", 10*time.Second, "per-request timeout")
-	jsonOut := flag.Bool("json", false, "emit results as JSON")
-	rps := flag.Float64("rps", 10, "max requests per second per host (0 = unlimited)")
-	flag.Parse()
-
-	if flag.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: linkcheck [flags] <url>")
-		flag.PrintDefaults()
-		os.Exit(2)
-	}
-	root, err := url.Parse(flag.Arg(0))
-	if err != nil || root.Host == "" {
-		fmt.Fprintf(os.Stderr, "linkcheck: invalid url %q\n", flag.Arg(0))
-		os.Exit(2)
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
-	c := newCrawler(root, *depth, *timeout)
-	c.rps = *rps
-	if st, err := os.Stderr.Stat(); err == nil && st.Mode()&os.ModeCharDevice != 0 {
-		c.progress = os.Stderr
-	}
-	checked, broken := c.run(ctx, *workers)
-
-	rep := report{Checked: checked, Interrupted: ctx.Err() != nil, Broken: broken}
-	if err := rep.write(os.Stdout, *jsonOut); err != nil {
-		fmt.Fprintln(os.Stderr, "linkcheck:", err)
-		os.Exit(2)
-	}
-	if len(broken) > 0 {
-		os.Exit(1)
 	}
 }
