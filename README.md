@@ -7,7 +7,8 @@ Built as a Go study project: worker pools, channels, `context` cancellation,
 table-driven tests. Two dependencies: `golang.org/x/time/rate` and
 `golang.org/x/net/html`.
 
-It is both a command and an importable package.
+It is a command, an importable package and a REST service. Worked examples
+for each are in [docs/use-cases.md](docs/use-cases.md).
 
 ## Usage
 
