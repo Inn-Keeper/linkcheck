@@ -8,11 +8,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/html"
@@ -56,6 +58,13 @@ type Options struct {
 	RPS       float64       // max requests per second per host; 0 means unlimited
 	UserAgent string        // "" means "linkcheck/1.0"
 
+	// DenyPrivateNetworks refuses to connect to loopback, private,
+	// link-local and other non-public addresses, including via redirects
+	// and DNS. Set it whenever rootURL comes from an untrusted caller
+	// (SSRF). It also disables any proxy from the environment. Refused URLs
+	// are reported as broken.
+	DenyPrivateNetworks bool
+
 	// OnProgress, if set, is called after every checked URL with the running
 	// totals. Calls are sequential, from a single goroutine.
 	OnProgress func(checked, broken int)
@@ -84,6 +93,8 @@ func Check(ctx context.Context, rootURL string, opts Options) (Report, error) {
 	c := newCrawler(root, opts.MaxDepth, opts.Timeout)
 	c.rps = opts.RPS
 	c.onProgress = opts.OnProgress
+	c.denyPrivate = opts.DenyPrivateNetworks
+	defer c.client.CloseIdleConnections()
 	if opts.UserAgent != "" {
 		c.userAgent = opts.UserAgent
 	}
@@ -98,14 +109,15 @@ type job struct {
 }
 
 type crawler struct {
-	client     *http.Client
-	root       *url.URL
-	host       string // same-host scope; follows the root's redirect, if any
-	maxDepth   int
-	onProgress func(checked, broken int) // may be nil
-	rps        float64                   // per-host request rate; <= 0 means unlimited
-	backoff    time.Duration             // first retry delay, doubles per attempt
-	userAgent  string
+	client      *http.Client
+	root        *url.URL
+	host        string // same-host scope; follows the root's redirect, if any
+	maxDepth    int
+	onProgress  func(checked, broken int) // may be nil
+	rps         float64                   // per-host request rate; <= 0 means unlimited
+	backoff     time.Duration             // first retry delay, doubles per attempt
+	userAgent   string
+	denyPrivate bool // refuse to dial non-public addresses
 
 	mu      sync.Mutex
 	visited map[string]bool
@@ -118,9 +130,69 @@ type crawler struct {
 	wg      sync.WaitGroup // counts outstanding jobs, not workers
 }
 
+var errBlocked = errors.New("linkcheck: address is not public")
+
+// blockedNets are non-public ranges that netip's IsGlobalUnicast and
+// IsPrivate don't already exclude.
+// ponytail: IPv4 embedded in 6to4/Teredo addresses is not unpacked; add if
+// the service runs on a host with those tunnels.
+var blockedNets = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"), // carrier-grade NAT
+	netip.MustParsePrefix("192.0.0.0/24"),  // IETF protocol assignments
+	netip.MustParsePrefix("198.18.0.0/15"), // benchmarking
+	netip.MustParsePrefix("240.0.0.0/4"),   // reserved
+	netip.MustParsePrefix("64:ff9b::/96"),  // NAT64, can map to private IPv4
+}
+
+// publicAddr reports whether ip is safe to dial on behalf of an untrusted
+// caller: not loopback, private, link-local (cloud metadata), or reserved.
+func publicAddr(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	for _, p := range blockedNets {
+		if p.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
 func newCrawler(root *url.URL, maxDepth int, timeout time.Duration) *crawler {
+	c := newCrawlerState(root, maxDepth)
+	// The guard runs in the dialer, after DNS resolution, so it sees the
+	// address actually being connected to. That covers redirects and DNS
+	// names that resolve to internal addresses.
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control: func(network, address string, _ syscall.RawConn) error {
+			if !c.denyPrivate {
+				return nil
+			}
+			ap, err := netip.ParseAddrPort(address)
+			if err != nil || !publicAddr(ap.Addr()) {
+				return errBlocked
+			}
+			return nil
+		},
+	}
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = dialer.DialContext
+	t.Proxy = func(r *http.Request) (*url.URL, error) {
+		if c.denyPrivate {
+			return nil, nil // a proxy would dial for us, past the guard
+		}
+		return http.ProxyFromEnvironment(r)
+	}
+	c.client = &http.Client{Timeout: timeout, Transport: t}
+	return c
+}
+
+func newCrawlerState(root *url.URL, maxDepth int) *crawler {
 	return &crawler{
-		client:    &http.Client{Timeout: timeout},
 		root:      root,
 		host:      root.Host,
 		maxDepth:  maxDepth,
@@ -245,6 +317,9 @@ func (c *crawler) process(ctx context.Context, j job) {
 // retryable reports whether a fetch outcome is worth another attempt:
 // transport errors (except a host that doesn't exist), 429, or any 5xx.
 func retryable(resp *http.Response, err error) bool {
+	if errors.Is(err, errBlocked) {
+		return false
+	}
 	if err != nil {
 		var dnsErr *net.DNSError
 		return !(errors.As(err, &dnsErr) && dnsErr.IsNotFound)

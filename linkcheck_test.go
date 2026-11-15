@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"reflect"
 	"strings"
@@ -349,6 +350,54 @@ func TestExternalLinksCheckedNotCrawled(t *testing.T) {
 	if checked != 2 || len(broken) != 0 || deepHits.Load() != 0 {
 		t.Fatalf("checked %d, broken %v, external /deeper fetched %d times; want 2 checked, none broken, never fetched",
 			checked, broken, deepHits.Load())
+	}
+}
+
+func TestDenyPrivateNetworksBlocksLoopback(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+	}))
+	defer srv.Close() // listens on 127.0.0.1
+
+	rep, err := Check(context.Background(), srv.URL, Options{DenyPrivateNetworks: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Broken) != 1 || !strings.Contains(rep.Broken[0].Err, "not public") {
+		t.Errorf("report = %+v, want the loopback url refused", rep)
+	}
+	if hits.Load() != 0 {
+		t.Errorf("loopback server got %d requests, want 0", hits.Load())
+	}
+}
+
+func TestPublicAddr(t *testing.T) {
+	tests := []struct {
+		addr string
+		want bool
+	}{
+		{"8.8.8.8", true},
+		{"2606:4700:4700::1111", true},
+		{"127.0.0.1", false},
+		{"::1", false},
+		{"::ffff:127.0.0.1", false}, // IPv4-mapped loopback
+		{"10.0.0.1", false},
+		{"172.16.0.1", false},
+		{"192.168.1.1", false},
+		{"169.254.169.254", false}, // cloud metadata
+		{"100.64.0.1", false},
+		{"0.0.0.0", false},
+		{"fd00::1", false},
+		{"fe80::1", false},
+		{"64:ff9b::a00:1", false}, // NAT64 for 10.0.0.1
+		{"224.0.0.1", false},
+		{"255.255.255.255", false},
+	}
+	for _, tt := range tests {
+		if got := publicAddr(netip.MustParseAddr(tt.addr)); got != tt.want {
+			t.Errorf("publicAddr(%s) = %v, want %v", tt.addr, got, tt.want)
+		}
 	}
 }
 
