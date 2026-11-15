@@ -17,7 +17,9 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -39,6 +41,7 @@ type config struct {
 	maxCrawls    int           // crawls running at once, server-wide
 	ratePerMin   float64       // checks per minute per client address
 	burst        int           // checks a client may make back to back
+	origins      []string      // browser origins allowed by CORS; "*" for any
 	allowPrivate bool          // local development only: lets callers reach internal addresses
 }
 
@@ -141,7 +144,48 @@ func newHandler(cfg config) http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
-	return mux
+	return cors(cfg.origins, mux)
+}
+
+// cors lets browser pages on the allowed origins call the API. "*" allows
+// any origin. Other origins get no CORS headers, so the browser refuses the
+// preflight and the POST is never sent.
+func cors(origins []string, next http.Handler) http.Handler {
+	if len(origins) == 0 {
+		return next
+	}
+	any := slices.Contains(origins, "*")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Add("Vary", "Origin") // responses differ by origin; keep caches honest
+		origin := r.Header.Get("Origin")
+		if origin == "" || !(any || slices.Contains(origins, origin)) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		h.Set("Access-Control-Allow-Origin", origin)
+		h.Set("Access-Control-Expose-Headers", "Retry-After")
+		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			h.Set("Access-Control-Allow-Methods", "POST")
+			h.Set("Access-Control-Allow-Headers", "Content-Type")
+			h.Set("Access-Control-Max-Age", "600")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// parseOrigins splits the -cors-origins flag: comma-separated, spaces and a
+// trailing slash forgiven.
+func parseOrigins(s string) []string {
+	var out []string
+	for _, o := range strings.Split(s, ",") {
+		if o = strings.TrimSuffix(strings.TrimSpace(o), "/"); o != "" {
+			out = append(out, o)
+		}
+	}
+	return out
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -222,6 +266,7 @@ func main() {
 	maxCrawls := flag.Int("max-crawls", 8, "crawls running at once; further requests get 503")
 	ratePerMin := flag.Float64("rate", 6, "checks per minute allowed per client IP")
 	burst := flag.Int("burst", 3, "checks a client IP may make back to back")
+	origins := flag.String("cors-origins", "", `comma-separated browser origins allowed to call the API, e.g. "https://app.example.com"; "*" allows any`)
 	allowPrivate := flag.Bool("allow-private", false, "UNSAFE: allow crawling private/loopback addresses (local development)")
 	flag.Parse()
 
@@ -235,6 +280,7 @@ func main() {
 		maxCrawls:    *maxCrawls,
 		ratePerMin:   *ratePerMin,
 		burst:        *burst,
+		origins:      parseOrigins(*origins),
 		allowPrivate: *allowPrivate,
 	}
 	srv := &http.Server{

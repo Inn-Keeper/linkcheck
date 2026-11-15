@@ -147,6 +147,52 @@ func TestRateLimitIsPerIP(t *testing.T) {
 	}
 }
 
+func TestCORS(t *testing.T) {
+	cfg := testConfig()
+	cfg.origins = parseOrigins("https://app.example.com/, https://other.example.com")
+	h := newHandler(cfg)
+
+	preflight := func(origin string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodOptions, "/v1/checks", nil)
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		req.Header.Set("Access-Control-Request-Headers", "content-type")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := preflight("https://app.example.com")
+	if rec.Code != http.StatusNoContent ||
+		rec.Header().Get("Access-Control-Allow-Origin") != "https://app.example.com" ||
+		rec.Header().Get("Access-Control-Allow-Headers") != "Content-Type" {
+		t.Errorf("allowed preflight: status %d, headers %v", rec.Code, rec.Header())
+	}
+
+	rec = preflight("https://evil.example")
+	if rec.Code < 400 || rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("disallowed preflight: status %d, headers %v; want a refusal without CORS headers", rec.Code, rec.Header())
+	}
+
+	// The actual request carries the header too, or the browser hides the response.
+	req := httptest.NewRequest(http.MethodPost, "/v1/checks", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://other.example.com")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Header().Get("Access-Control-Allow-Origin") != "https://other.example.com" {
+		t.Errorf("POST response headers %v, want Access-Control-Allow-Origin", rec.Header())
+	}
+
+	t.Run("wildcard", func(t *testing.T) {
+		cfg.origins = parseOrigins("*")
+		h = newHandler(cfg)
+		if rec := preflight("https://anything.example"); rec.Code != http.StatusNoContent {
+			t.Errorf("status %d, want 204 with -cors-origins '*'", rec.Code)
+		}
+	})
+}
+
 // hangingSite never answers, and reports each request it receives on hit.
 func hangingSite(t *testing.T) (target *httptest.Server, hit chan struct{}) {
 	block := make(chan struct{})
