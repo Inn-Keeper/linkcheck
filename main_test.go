@@ -267,6 +267,12 @@ func TestExtractLinks(t *testing.T) {
 		{"single quotes", `<a href='/top'>x</a>`, []string{"https://example.com/top"}},
 		{"mailto skipped", `<a href="mailto:a@b.c">x</a>`, nil},
 		{"none", `no links here`, nil},
+		{"entities decoded", `<a href="/a?x=1&amp;y=2">x</a>`, []string{"https://example.com/a?x=1&y=2"}},
+		{"comment ignored", `<!-- <a href="/old">x</a> -->`, nil},
+		{"script ignored", `<script>var s = '<a href="/js">x</a>';</script>`, nil},
+		{"src checked", `<img src="/logo.png">`, []string{"https://example.com/logo.png"}},
+		{"unquoted", `<a href=/bare>x</a>`, []string{"https://example.com/bare"}},
+		{"base href", `<base href="/docs/"><a href="p.html">x</a>`, []string{"https://example.com/docs/p.html"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

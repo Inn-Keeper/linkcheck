@@ -10,18 +10,14 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"golang.org/x/net/html"
 	"golang.org/x/time/rate"
 )
-
-// ponytail: regex link extraction; swap for golang.org/x/net/html if unquoted
-// or malformed attributes start to matter.
-var hrefRe = regexp.MustCompile(`(?i)href\s*=\s*["']([^"']+)["']`)
 
 const (
 	maxBodySize      = 2 << 20 // don't slurp unbounded pages into memory
@@ -281,23 +277,42 @@ func (c *crawler) limiter(host string) *rate.Limiter {
 	return l
 }
 
-// extractLinks returns absolute http(s) URLs referenced by href attributes,
-// resolved against base, with fragments stripped.
+// extractLinks returns absolute http(s) URLs referenced by href and src
+// attributes, resolved against base (or the page's <base href>), with
+// fragments stripped. The tokenizer decodes entities and skips comments and
+// script bodies.
+// ponytail: srcset and CSS url() are not followed; add if images in those
+// matter.
 func extractLinks(base *url.URL, body string) []*url.URL {
 	var out []*url.URL
-	for _, m := range hrefRe.FindAllStringSubmatch(body, -1) {
-		ref, err := url.Parse(strings.TrimSpace(m[1]))
-		if err != nil {
-			continue
+	z := html.NewTokenizer(strings.NewReader(body))
+	for {
+		switch z.Next() {
+		case html.ErrorToken:
+			return out // io.EOF, or malformed input: keep what we found
+		case html.StartTagToken, html.SelfClosingTagToken:
+			t := z.Token()
+			for _, a := range t.Attr {
+				if a.Key != "href" && a.Key != "src" {
+					continue
+				}
+				ref, err := url.Parse(strings.TrimSpace(a.Val))
+				if err != nil {
+					continue
+				}
+				abs := base.ResolveReference(ref)
+				if t.Data == "base" {
+					base = abs // later links resolve against it; not a link itself
+					continue
+				}
+				if (abs.Scheme != "http" && abs.Scheme != "https") || abs.Host == "" {
+					continue
+				}
+				abs.Fragment = ""
+				out = append(out, abs)
+			}
 		}
-		abs := base.ResolveReference(ref)
-		if (abs.Scheme != "http" && abs.Scheme != "https") || abs.Host == "" {
-			continue
-		}
-		abs.Fragment = ""
-		out = append(out, abs)
 	}
-	return out
 }
 
 func main() {
