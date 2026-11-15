@@ -64,6 +64,59 @@ rep, err := linkcheck.Check(ctx, "https://example.com", linkcheck.Options{
   also covers redirects and DNS names that resolve to internal addresses.
   Refused URLs show up as broken.
 
+## As a service
+
+`linkcheckd` exposes the checker over REST for public callers.
+
+```sh
+go build -o linkcheckd ./cmd/linkcheckd
+./linkcheckd -addr :8080 -cors-origins https://app.example.com
+```
+
+```console
+$ curl -s localhost:8080/v1/checks -H 'Content-Type: application/json' \
+    -d '{"url": "https://example.com", "depth": 1}'
+{"checked":107,"broken":[{"url":"https://example.com/old-post","status":404,"found_on":"https://example.com/blog"}]}
+```
+
+`depth` is optional (default `1`). The response is the same report as
+`linkcheck -json`, plus two flags a client should surface:
+`"interrupted": true` when the crawl hit the server deadline and
+`"truncated": true` when it hit the URL cap. Both mean partial results.
+
+| Status | Meaning |
+| ------ | ------- |
+| `200` | report (possibly partial, see above) |
+| `400` | bad JSON, unknown field, bad URL, depth out of range: `{"error": "..."}` |
+| `415` | `Content-Type` is not `application/json` |
+| `429` | this IP is over its rate limit; see `Retry-After` |
+| `503` | all crawl slots are busy; see `Retry-After` |
+
+| Flag | Default | Meaning |
+| ---- | ------- | ------- |
+| `-addr` | `:8080` | listen address |
+| `-timeout` | `25s` | hard deadline per crawl; keep it under your load balancer's |
+| `-max-depth` | `2` | highest depth a caller may request |
+| `-max-urls` | `200` | most URLs checked per crawl |
+| `-max-crawls` | `8` | crawls running at once, server-wide |
+| `-rate` | `6` | checks per minute per client IP (IPv6: per /64) |
+| `-burst` | `3` | checks a client IP may make back to back |
+| `-cors-origins` | none | comma-separated browser origins allowed to call the API; `*` for any |
+| `-allow-private` | `false` | **unsafe**, local development only: allow private/loopback targets |
+
+Things to know before deploying:
+
+- Callers can only reach public addresses; the private-network guard is
+  always on unless `-allow-private` is set.
+- The client IP is the TCP peer. Forwarding headers are ignored because
+  anyone can forge them. If you later put a proxy or load balancer in
+  front, every caller will share its IP until `clientIP` is taught to
+  trust that proxy's header.
+- Rate-limit state is in memory, per process. Run one instance, or move it
+  to a shared store first.
+- There is no authentication and no TLS; terminate TLS in front or add it.
+- `GET /healthz` answers `204`.
+
 ## How it works
 
 - A fixed pool of worker goroutines pulls URLs from a jobs channel; a
