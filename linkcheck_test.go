@@ -372,6 +372,17 @@ func TestDenyPrivateNetworksBlocksLoopback(t *testing.T) {
 	}
 }
 
+func TestErrorMessageHidesResolver(t *testing.T) {
+	err := &url.Error{Op: "Get", URL: "https://gone.example/", Err: &net.OpError{Op: "dial", Net: "tcp",
+		Err: &net.DNSError{Err: "no such host", Name: "gone.example", Server: "169.254.20.10:53", IsNotFound: true}}}
+	if got, want := errorMessage(err), "lookup gone.example: no such host"; got != want {
+		t.Errorf("errorMessage = %q, want %q", got, want)
+	}
+	if got := errorMessage(errors.New("connection reset")); got != "connection reset" {
+		t.Errorf("errorMessage changed an ordinary error to %q", got)
+	}
+}
+
 func TestMaxURLsTruncates(t *testing.T) {
 	var links strings.Builder
 	for i := range 10 {
