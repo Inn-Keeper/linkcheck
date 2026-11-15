@@ -147,6 +147,41 @@ func TestRateLimitIsPerIP(t *testing.T) {
 	}
 }
 
+func TestClientIPHeader(t *testing.T) {
+	cfg := testConfig()
+	cfg.ratePerMin, cfg.burst = 1, 1
+	cfg.clientIPHeader = "CF-Connecting-IP"
+	h := newHandler(cfg)
+
+	// Every request arrives from the same proxy address.
+	from := func(headerIP string) int {
+		req := httptest.NewRequest(http.MethodPost, "/v1/checks", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "10.0.0.1:1000"
+		if headerIP != "" {
+			req.Header.Set("CF-Connecting-IP", headerIP)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if from("198.51.100.1") == http.StatusTooManyRequests {
+		t.Fatal("first client limited on its first request")
+	}
+	if from("198.51.100.2") == http.StatusTooManyRequests {
+		t.Error("second client shares the first client's bucket, want its own")
+	}
+	if from("198.51.100.1") != http.StatusTooManyRequests {
+		t.Error("first client not limited on its second request")
+	}
+	// No usable header: fall back to the proxy address, one shared bucket.
+	from("")
+	if from("not-an-ip") != http.StatusTooManyRequests {
+		t.Error("requests without a valid header are not limited together")
+	}
+}
+
 func TestCORS(t *testing.T) {
 	cfg := testConfig()
 	cfg.origins = parseOrigins("https://app.example.com/, https://other.example.com")
