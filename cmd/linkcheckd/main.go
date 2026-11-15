@@ -154,12 +154,12 @@ func cors(origins []string, next http.Handler) http.Handler {
 	if len(origins) == 0 {
 		return next
 	}
-	any := slices.Contains(origins, "*")
+	allowAll := slices.Contains(origins, "*")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Add("Vary", "Origin") // responses differ by origin; keep caches honest
 		origin := r.Header.Get("Origin")
-		if origin == "" || !(any || slices.Contains(origins, origin)) {
+		if origin == "" || !(allowAll || slices.Contains(origins, origin)) {
 			next.ServeHTTP(w, r)
 			return
 		}
