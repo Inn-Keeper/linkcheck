@@ -74,6 +74,7 @@ type job struct {
 type crawler struct {
 	client   *http.Client
 	root     *url.URL
+	host     string // same-host scope; follows the root's redirect, if any
 	maxDepth int
 	progress io.Writer     // nil disables the live progress line
 	rps      float64       // per-host request rate; <= 0 means unlimited
@@ -94,6 +95,7 @@ func newCrawler(root *url.URL, maxDepth int, timeout time.Duration) *crawler {
 	return &crawler{
 		client:   &http.Client{Timeout: timeout},
 		root:     root,
+		host:     root.Host,
 		maxDepth: maxDepth,
 		backoff:  retryBackoff,
 		visited:  map[string]bool{},
@@ -193,11 +195,20 @@ func (c *crawler) process(ctx context.Context, j job) {
 	}
 	defer resp.Body.Close()
 
+	// Redirects may have moved us: scope and relative links follow the final
+	// URL, not the one we asked for.
+	final := resp.Request.URL
+	if j.depth == 0 {
+		// Only the root job is running at this point, so this write is
+		// ordered before every later read (e.g. example.com -> www.example.com).
+		c.host = final.Host
+	}
+
 	r := result{URL: j.u.String(), Status: resp.StatusCode, FoundOn: j.foundOn}
 	// Recurse only into same-host HTML pages within the depth limit;
 	// external links get checked but never crawled.
 	crawlable := resp.StatusCode < 400 && j.depth < c.maxDepth &&
-		j.u.Host == c.root.Host &&
+		final.Host == c.host &&
 		strings.Contains(resp.Header.Get("Content-Type"), "text/html")
 	if !crawlable {
 		c.results <- r
@@ -210,8 +221,8 @@ func (c *crawler) process(ctx context.Context, j job) {
 		return
 	}
 	c.results <- r
-	for _, link := range extractLinks(j.u, string(body)) {
-		c.enqueue(ctx, job{u: link, depth: j.depth + 1, foundOn: j.u.String()})
+	for _, link := range extractLinks(final, string(body)) {
+		c.enqueue(ctx, job{u: link, depth: j.depth + 1, foundOn: final.String()})
 	}
 }
 

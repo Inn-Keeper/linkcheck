@@ -181,6 +181,31 @@ func TestCancelStopsCrawl(t *testing.T) {
 	}
 }
 
+func htmlPage(body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, body)
+	}
+}
+
+func TestRedirectResolvesLinksAgainstFinalURL(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/{$}", htmlPage(`<a href="/docs">docs</a>`))
+	mux.HandleFunc("/docs", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/docs/", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/docs/{$}", htmlPage(`<a href="page.html">page</a>`))
+	mux.HandleFunc("/docs/page.html", htmlPage(``))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	root, _ := url.Parse(srv.URL)
+	checked, broken := newCrawler(root, 3, 5*time.Second).run(context.Background(), 4)
+	if checked != 3 || len(broken) != 0 {
+		t.Fatalf("checked %d, broken %v; want 3 checked, none broken", checked, broken)
+	}
+}
+
 func FuzzExtractLinks(f *testing.F) {
 	for _, seed := range []string{
 		`<a href="other.html">x</a>`,
