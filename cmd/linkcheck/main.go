@@ -84,6 +84,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "linkcheck:", err)
 		os.Exit(2)
 	}
+	if rep.Interrupted {
+		os.Exit(130) // partial results must not look like a pass
+	}
 	if len(rep.Broken) > 0 {
 		os.Exit(1)
 	}
