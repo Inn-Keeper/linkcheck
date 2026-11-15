@@ -28,6 +28,7 @@ const (
 	progressInterval = 200 * time.Millisecond
 	maxAttempts      = 3                      // total tries per url on transient failures
 	retryBackoff     = 500 * time.Millisecond // doubles per retry
+	defaultUserAgent = "linkcheck/1.0"        // Go's default UA gets blocked a lot
 )
 
 type result struct {
@@ -72,13 +73,14 @@ type job struct {
 }
 
 type crawler struct {
-	client   *http.Client
-	root     *url.URL
-	host     string // same-host scope; follows the root's redirect, if any
-	maxDepth int
-	progress io.Writer     // nil disables the live progress line
-	rps      float64       // per-host request rate; <= 0 means unlimited
-	backoff  time.Duration // first retry delay, doubles per attempt
+	client    *http.Client
+	root      *url.URL
+	host      string // same-host scope; follows the root's redirect, if any
+	maxDepth  int
+	progress  io.Writer     // nil disables the live progress line
+	rps       float64       // per-host request rate; <= 0 means unlimited
+	backoff   time.Duration // first retry delay, doubles per attempt
+	userAgent string
 
 	mu      sync.Mutex
 	visited map[string]bool
@@ -93,15 +95,16 @@ type crawler struct {
 
 func newCrawler(root *url.URL, maxDepth int, timeout time.Duration) *crawler {
 	return &crawler{
-		client:   &http.Client{Timeout: timeout},
-		root:     root,
-		host:     root.Host,
-		maxDepth: maxDepth,
-		backoff:  retryBackoff,
-		visited:  map[string]bool{},
-		limiters: map[string]*rate.Limiter{},
-		jobs:     make(chan job, 64),
-		results:  make(chan result, 64),
+		client:    &http.Client{Timeout: timeout},
+		root:      root,
+		host:      root.Host,
+		maxDepth:  maxDepth,
+		backoff:   retryBackoff,
+		userAgent: defaultUserAgent,
+		visited:   map[string]bool{},
+		limiters:  map[string]*rate.Limiter{},
+		jobs:      make(chan job, 64),
+		results:   make(chan result, 64),
 	}
 }
 
@@ -244,6 +247,7 @@ func (c *crawler) fetch(ctx context.Context, u *url.URL) (*http.Response, error)
 		if err != nil {
 			return nil, err
 		}
+		req.Header.Set("User-Agent", c.userAgent)
 		resp, err := c.client.Do(req)
 		if !retryable(resp, err) || attempt == maxAttempts {
 			return resp, err

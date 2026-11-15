@@ -206,6 +206,21 @@ func TestRedirectResolvesLinksAgainstFinalURL(t *testing.T) {
 	}
 }
 
+func TestSendsUserAgent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.UserAgent() != defaultUserAgent {
+			w.WriteHeader(http.StatusForbidden)
+		}
+	}))
+	defer srv.Close()
+
+	root, _ := url.Parse(srv.URL)
+	_, broken := newCrawler(root, 0, 5*time.Second).run(context.Background(), 1)
+	if len(broken) != 0 {
+		t.Fatalf("server rejected the User-Agent: %v", broken)
+	}
+}
+
 func FuzzExtractLinks(f *testing.F) {
 	for _, seed := range []string{
 		`<a href="other.html">x</a>`,
