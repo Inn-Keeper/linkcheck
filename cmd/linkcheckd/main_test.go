@@ -18,6 +18,8 @@ func testConfig() config {
 		maxDepth:     2,
 		maxURLs:      50,
 		maxCrawls:    4,
+		ratePerMin:   6000, // out of the way unless a test lowers it
+		burst:        100,
 		allowPrivate: true, // the sites under test listen on loopback
 	}
 }
@@ -107,6 +109,42 @@ func TestBadRequests(t *testing.T) {
 			t.Errorf("status %d, want 415", rec.Code)
 		}
 	})
+}
+
+func TestRateLimitIsPerIP(t *testing.T) {
+	cfg := testConfig()
+	cfg.ratePerMin, cfg.burst = 1, 2
+	h := newHandler(cfg)
+
+	from := func(remoteAddr string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/checks", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Forwarded-For", "203.0.113.99") // must not buy a fresh bucket
+		req.RemoteAddr = remoteAddr
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	for i := range 2 {
+		if rec := from("198.51.100.1:1000"); rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("request %d limited, want the burst of 2 allowed", i+1)
+		}
+	}
+	rec := from("198.51.100.1:2000") // same IP, another connection
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+		t.Errorf("status %d, Retry-After %q; want 429 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	if rec := from("198.51.100.2:1000"); rec.Code == http.StatusTooManyRequests {
+		t.Error("a different IP was limited")
+	}
+
+	// IPv6 clients are limited per /64.
+	from("[2001:db8:1:2::1]:1000")
+	from("[2001:db8:1:2::2]:1000")
+	if rec := from("[2001:db8:1:2::3]:1000"); rec.Code != http.StatusTooManyRequests {
+		t.Errorf("status %d for a third address in one /64, want 429", rec.Code)
+	}
 }
 
 // hangingSite never answers, and reports each request it receives on hit.

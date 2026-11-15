@@ -11,14 +11,19 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"mime"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/Inn-Keeper/linkcheck"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -32,7 +37,86 @@ type config struct {
 	maxDepth     int           // highest depth a caller may ask for
 	maxURLs      int           // urls checked per crawl
 	maxCrawls    int           // crawls running at once, server-wide
+	ratePerMin   float64       // checks per minute per client address
+	burst        int           // checks a client may make back to back
 	allowPrivate bool          // local development only: lets callers reach internal addresses
+}
+
+// ipLimiter gives every client address its own token bucket.
+// ponytail: in-memory and per-process; move to a shared store if this runs
+// as more than one instance.
+type ipLimiter struct {
+	limit rate.Limit
+	burst int
+	ttl   time.Duration // idle time after which a bucket is full again and can go
+
+	mu        sync.Mutex
+	clients   map[netip.Addr]*client
+	lastSweep time.Time
+}
+
+type client struct {
+	lim  *rate.Limiter
+	seen time.Time
+}
+
+func newIPLimiter(perMinute float64, burst int) *ipLimiter {
+	limit := rate.Limit(perMinute / 60)
+	return &ipLimiter{
+		limit:   limit,
+		burst:   burst,
+		ttl:     time.Duration(float64(burst)/float64(limit)*float64(time.Second)) + time.Minute,
+		clients: map[netip.Addr]*client{},
+	}
+}
+
+// wait returns how long addr must wait before its next check; 0 means go.
+func (l *ipLimiter) wait(addr netip.Addr) time.Duration {
+	addr = addr.Unmap()
+	if addr.Is6() {
+		// One subscriber usually controls a whole /64, so limit the block.
+		if p, err := addr.Prefix(64); err == nil {
+			addr = p.Addr()
+		}
+	}
+	now := time.Now()
+
+	l.mu.Lock()
+	if now.Sub(l.lastSweep) > time.Minute {
+		for a, c := range l.clients {
+			if now.Sub(c.seen) > l.ttl {
+				delete(l.clients, a)
+			}
+		}
+		l.lastSweep = now
+	}
+	c := l.clients[addr]
+	if c == nil {
+		c = &client{lim: rate.NewLimiter(l.limit, l.burst)}
+		l.clients[addr] = c
+	}
+	c.seen = now
+	l.mu.Unlock()
+
+	r := c.lim.ReserveN(now, 1)
+	d := r.DelayFrom(now)
+	if d > 0 {
+		r.CancelAt(now) // refused, so give the token back
+	}
+	return d
+}
+
+// clientIP is the peer address of the connection. Forwarding headers are
+// ignored on purpose: with no trusted proxy in front, callers could forge
+// them to dodge the limit.
+// ponytail: behind a load balancer every caller shares its address; read
+// the balancer's header here once there is one.
+func clientIP(r *http.Request) netip.Addr {
+	ap, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil {
+		return netip.Addr{} // unparseable peers share one bucket
+	}
+	return ap.Addr()
 }
 
 type checkRequest struct {
@@ -41,12 +125,17 @@ type checkRequest struct {
 }
 
 type server struct {
-	cfg   config
-	slots chan struct{} // one token per running crawl
+	cfg     config
+	slots   chan struct{} // one token per running crawl
+	limiter *ipLimiter
 }
 
 func newHandler(cfg config) http.Handler {
-	s := &server{cfg: cfg, slots: make(chan struct{}, cfg.maxCrawls)}
+	s := &server{
+		cfg:     cfg,
+		slots:   make(chan struct{}, cfg.maxCrawls),
+		limiter: newIPLimiter(cfg.ratePerMin, cfg.burst),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/checks", s.check)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +155,12 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 }
 
 func (s *server) check(w http.ResponseWriter, r *http.Request) {
+	// First, before any work: every request counts, valid or not.
+	if d := s.limiter.wait(clientIP(r)); d > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(d.Seconds()))))
+		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	}
 	// Requiring JSON also forces browsers to preflight, so a page on another
 	// origin cannot trigger a crawl with a plain form post.
 	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt != "application/json" {
@@ -125,17 +220,21 @@ func main() {
 	maxDepth := flag.Int("max-depth", 2, "highest crawl depth a caller may request")
 	maxURLs := flag.Int("max-urls", 200, "most urls checked per crawl")
 	maxCrawls := flag.Int("max-crawls", 8, "crawls running at once; further requests get 503")
+	ratePerMin := flag.Float64("rate", 6, "checks per minute allowed per client IP")
+	burst := flag.Int("burst", 3, "checks a client IP may make back to back")
 	allowPrivate := flag.Bool("allow-private", false, "UNSAFE: allow crawling private/loopback addresses (local development)")
 	flag.Parse()
 
-	if *timeout <= 0 || *maxDepth < 0 || *maxURLs < 1 || *maxCrawls < 1 {
-		log.Fatal("linkcheckd: -timeout, -max-urls and -max-crawls must be positive, -max-depth not negative")
+	if *timeout <= 0 || *maxDepth < 0 || *maxURLs < 1 || *maxCrawls < 1 || *ratePerMin <= 0 || *burst < 1 {
+		log.Fatal("linkcheckd: -timeout, -max-urls, -max-crawls, -rate and -burst must be positive, -max-depth not negative")
 	}
 	cfg := config{
 		timeout:      *timeout,
 		maxDepth:     *maxDepth,
 		maxURLs:      *maxURLs,
 		maxCrawls:    *maxCrawls,
+		ratePerMin:   *ratePerMin,
+		burst:        *burst,
 		allowPrivate: *allowPrivate,
 	}
 	srv := &http.Server{
